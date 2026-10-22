@@ -5,176 +5,172 @@ import { useRef, useState } from "react";
 
 const API = "http://localhost:8000";
 
+type Location = {
+  lat: number;
+  lng: number;
+};
+
+type Detection = {
+  class: string;
+  confidence: number;
+  box: number[];
+};
+
 export default function Home() {
   const video = useRef<HTMLVideoElement>(null);
   const canvas = useRef<HTMLCanvasElement>(null);
   const stream = useRef<MediaStream | null>(null);
   const timer = useRef<ReturnType<typeof setInterval> | null>(null);
   const gpsWatch = useRef<number | null>(null);
-  const frames = useRef<string[]>([]);
-  const lastGPS = useRef<any>(null);
-  const startGPS = useRef<any>(null);
-  const distance = useRef(0);
-  const busy = useRef(false);
   const running = useRef(false);
+  const busy = useRef(false);
+  const lastGPS = useRef<Location | null>(null);
 
-  const [status, setStatus] = useState("Ready to start");
-  const [meters, setMeters] = useState(0);
-  const [count, setCount] = useState(0);
-  const [segments, setSegments] = useState(0);
-  const [gps, setGps] = useState("Waiting for GPS");
   const [active, setActive] = useState(false);
-
-  function gap(a: any, b: any) {
-    const rad = (n: number) => n * Math.PI / 180;
-    const dLat = rad(b.lat - a.lat);
-    const dLon = rad(b.lng - a.lng);
-    const x =
-      Math.sin(dLat / 2) ** 2 +
-      Math.cos(rad(a.lat)) * Math.cos(rad(b.lat)) *
-      Math.sin(dLon / 2) ** 2;
-
-    return 6371000 * 2 * Math.atan2(
-      Math.sqrt(x), Math.sqrt(1 - x)
-    );
-  }
-
-  async function sendSegment(end: any) {
-    if (
-      busy.current ||
-      distance.current < 10 ||
-      frames.current.length === 0 ||
-      !startGPS.current
-    ) return;
-
-    busy.current = true;
-
-    const batch = [...frames.current];
-    const start = startGPS.current;
-    const distanceM = distance.current;
-
-    frames.current = [];
-    distance.current = 0;
-    startGPS.current = end;
-    setMeters(0);
-    setStatus("Analysing road footage...");
-
-    try {
-      const response = await fetch(`${API}/detect`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          frames: batch,
-          start,
-          end,
-          distance_m: distanceM
-        })
-      });
-
-      if (!response.ok) throw new Error("Detection request failed");
-
-      const result = await response.json();
-
-      setCount(old => old + result.pothole_count);
-      setSegments(old => old + 1);
-      setStatus("Segment analysed successfully");
-    } catch {
-      frames.current.unshift(...batch);
-      distance.current += distanceM;
-      startGPS.current = start;
-      setMeters(Math.floor(distance.current));
-      setStatus("API error. Segment retained for retry.");
-    } finally {
-      busy.current = false;
-    }
-  }
+  const [intervalSec, setIntervalSec] = useState(2);
+  const [status, setStatus] = useState("Ready to start");
+  const [gps, setGps] = useState("Waiting for permission");
+  const [count, setCount] = useState(0);
+  const [framesProcessed, setFramesProcessed] = useState(0);
+  const [lastResult, setLastResult] = useState<Detection[]>([]);
+  const [lastTime, setLastTime] = useState("--");
 
   async function start() {
     if (running.current) return;
 
-    try {
-      setStatus("Opening camera...");
+    if (!navigator.geolocation) {
+      setStatus("Geolocation is not supported by this browser");
+      return;
+    }
 
-      stream.current = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: "environment" },
-        audio: false
+    try {
+      setStatus("Requesting camera permission...");
+
+      const media = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: "environment" } },
+        audio: false,
       });
 
+      stream.current = media;
+
       if (video.current) {
-        video.current.srcObject = stream.current;
+        video.current.srcObject = media;
         await video.current.play();
       }
 
       lastGPS.current = null;
-      startGPS.current = null;
-      distance.current = 0;
-      frames.current = [];
       running.current = true;
       setActive(true);
-      setStatus("Waiting for GPS...");
-      setGps("Acquiring location");
+      setStatus("Waiting for GPS location...");
+      setGps("Acquiring location...");
 
       gpsWatch.current = navigator.geolocation.watchPosition(
-        position => {
+        (position) => {
           if (!running.current) return;
 
-          const p = {
+          const location = {
             lat: position.coords.latitude,
-            lng: position.coords.longitude
+            lng: position.coords.longitude,
           };
 
-          setGps(`${p.lat.toFixed(5)}, ${p.lng.toFixed(5)}`);
-
-          if (lastGPS.current) {
-            const d = gap(lastGPS.current, p);
-
-            // Ignore implausible jumps
-            if (d < 50 && position.coords.accuracy < 50) {
-              distance.current += d;
-            }
-          } else {
-            startGPS.current = p;
-          }
-
-          lastGPS.current = p;
-          setMeters(Math.floor(distance.current));
-
-          if (distance.current >= 10) sendSegment(p);
+          lastGPS.current = location;
+          setGps(
+            `${location.lat.toFixed(6)}, ${location.lng.toFixed(6)}`
+          );
         },
-        error => setStatus("GPS error: " + error.message),
-        { enableHighAccuracy: true, maximumAge: 0 }
+        (error) => {
+          setGps("Location unavailable");
+          setStatus(`GPS error: ${error.message}`);
+        },
+        {
+          enableHighAccuracy: true,
+          maximumAge: 1000,
+          timeout: 15000,
+        }
       );
 
-      timer.current = setInterval(() => {
+      timer.current = setInterval(async () => {
         if (
           !running.current ||
+          busy.current ||
           !video.current ||
           !canvas.current ||
           video.current.readyState < 2
-        ) return;
+        ) {
+          return;
+        }
+
+        const location = lastGPS.current;
+
+        if (!location) {
+          setStatus("Waiting for GPS fix...");
+          return;
+        }
+
+        const ctx = canvas.current.getContext("2d");
+        if (!ctx) return;
 
         canvas.current.width = video.current.videoWidth;
         canvas.current.height = video.current.videoHeight;
 
-        canvas.current.getContext("2d")?.drawImage(
-          video.current, 0, 0
-        );
+        ctx.drawImage(video.current, 0, 0);
 
-        // Sample one frame per second
-        if (startGPS.current && frames.current.length < 30) {
-          frames.current.push(
-            canvas.current.toDataURL("image/jpeg", 0.7)
-          );
+        const frame = canvas.current.toDataURL("image/jpeg", 0.7);
+
+        busy.current = true;
+        setStatus("Running pothole detection...");
+
+        try {
+          const response = await fetch(`${API}/detect-frame`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              frame,
+              location,
+            }),
+          });
+
+          if (!response.ok) {
+            const message = await response.text();
+            throw new Error(message);
+          }
+
+          const result = await response.json();
+
+          if (!running.current) return;
+
+          setCount((old) => old + result.pothole_count);
+          setFramesProcessed((old) => old + 1);
+          setLastResult(result.detections || []);
+          setLastTime(new Date().toLocaleTimeString());
+          setStatus("Detection completed and saved");
+        } catch (error) {
+          if (running.current) {
+            setStatus(
+              error instanceof Error
+                ? `API error: ${error.message}`
+                : "Unable to contact FastAPI"
+            );
+          }
+        } finally {
+          busy.current = false;
         }
-      }, 1000);
+      }, intervalSec * 1000);
 
-      setStatus("Recording road footage");
-    } catch (e: any) {
-      stream.current?.getTracks().forEach(t => t.stop());
+      setStatus("Live monitoring started");
+    } catch (error) {
+      stream.current?.getTracks().forEach((track) => track.stop());
       stream.current = null;
       running.current = false;
       setActive(false);
-      setStatus(e.message || "Unable to access camera");
+
+      setStatus(
+        error instanceof Error
+          ? error.message
+          : "Unable to start camera"
+      );
     }
   }
 
@@ -189,128 +185,149 @@ export default function Home() {
     }
     gpsWatch.current = null;
 
-    stream.current?.getTracks().forEach(t => t.stop());
+    stream.current?.getTracks().forEach((track) => track.stop());
     stream.current = null;
 
     if (video.current) video.current.srcObject = null;
 
     setActive(false);
-    setStatus("Recording stopped");
+    setStatus("Monitoring stopped");
     setGps("GPS paused");
   }
 
   function reset() {
     stop();
 
-    frames.current = [];
     lastGPS.current = null;
-    startGPS.current = null;
-    distance.current = 0;
+    busy.current = false;
 
-    setMeters(0);
     setCount(0);
-    setSegments(0);
+    setFramesProcessed(0);
+    setLastResult([]);
+    setLastTime("--");
+    setGps("Waiting for permission");
     setStatus("Ready to start");
-    setGps("Waiting for GPS");
   }
 
-  return (
-    <main style={{
-      minHeight: "100vh",
-      background: "#f3f6fb",
-      color: "#17243a",
-      fontFamily: "Arial, sans-serif",
-      padding: "28px 16px"
-    }}>
-      <div style={{ maxWidth: 1100, margin: "auto" }}>
+  const buttonStyle = {
+    padding: "12px 20px",
+    borderRadius: 10,
+    border: "none",
+    fontWeight: 700,
+    fontSize: 14,
+    cursor: "pointer",
+  } as const;
 
-        <header style={{
-          display: "flex",
-          justifyContent: "space-between",
-          alignItems: "center",
-          flexWrap: "wrap",
-          gap: 16,
-          marginBottom: 28
-        }}>
+  return (
+    <main
+      style={{
+        minHeight: "100vh",
+        background: "#f4f7fb",
+        color: "#17243a",
+        fontFamily: "Arial, sans-serif",
+        padding: "28px 16px",
+      }}
+    >
+      <div style={{ maxWidth: 1100, margin: "auto" }}>
+        <header
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "center",
+            flexWrap: "wrap",
+            gap: 16,
+            marginBottom: 26,
+          }}
+        >
           <div>
-            <div style={{
-              color: "#2563eb",
-              fontSize: 13,
-              fontWeight: 700,
-              letterSpacing: 2
-            }}>ROADSENSE / LIVE MONITOR</div>
-            <h1 style={{ margin: "8px 0", fontSize: 30 }}>
+            <div
+              style={{
+                color: "#2563eb",
+                fontWeight: 700,
+                fontSize: 12,
+                letterSpacing: 2,
+              }}
+            >
+              ROADSENSE / LIVE MONITOR
+            </div>
+            <h1 style={{ margin: "9px 0", fontSize: 30 }}>
               Pothole Detection
             </h1>
-            <p style={{ color: "#64748b", margin: 0 }}>
-              Real-time road monitoring and damage analysis
+            <p style={{ margin: 0, color: "#64748b" }}>
+              Camera-based road damage monitoring
             </p>
           </div>
 
-          <div style={{
-            background: active ? "#dcfce7" : "#e2e8f0",
-            color: active ? "#166534" : "#475569",
-            padding: "10px 16px",
-            borderRadius: 30,
-            fontWeight: 700,
-            fontSize: 13
-          }}>
-            {active ? "● LIVE" : "● OFFLINE"}
+          <div
+            style={{
+              padding: "10px 16px",
+              borderRadius: 30,
+              background: active ? "#dcfce7" : "#e2e8f0",
+              color: active ? "#166534" : "#475569",
+              fontWeight: 700,
+              fontSize: 13,
+            }}
+          >
+            {active ? "● LIVE" : "● STOPPED"}
           </div>
         </header>
 
-        <section style={{
-          display: "grid",
-          gridTemplateColumns: "repeat(auto-fit, minmax(190px, 1fr))",
-          gap: 16,
-          marginBottom: 22
-        }}>
+        <section
+          style={{
+            display: "grid",
+            gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
+            gap: 15,
+            marginBottom: 22,
+          }}
+        >
           {[
-            { label: "Segment Distance", value: `${meters} / 10 m`, icon: "↔" },
-            { label: "Potholes Detected", value: count, icon: "⚠" },
-            { label: "Segments Analysed", value: segments, icon: "▦" }
-          ].map(item => (
-            <div key={item.label} style={{
-              background: "white",
-              padding: 22,
-              borderRadius: 16,
-              border: "1px solid #e2e8f0",
-              boxShadow: "0 4px 16px #0f172a08"
-            }}>
-              <div style={{ color: "#64748b", fontSize: 14 }}>
-                {item.icon} &nbsp; {item.label}
+            { label: "Pothole detections", value: count },
+            { label: "Frames processed", value: framesProcessed },
+            { label: "Interval", value: `${intervalSec} second(s)` },
+          ].map((item) => (
+            <div
+              key={item.label}
+              style={{
+                background: "white",
+                padding: 22,
+                border: "1px solid #e2e8f0",
+                borderRadius: 15,
+              }}
+            >
+              <div style={{ color: "#64748b", fontSize: 13 }}>
+                {item.label}
               </div>
-              <div style={{
-                fontSize: 27,
-                fontWeight: 700,
-                marginTop: 12
-              }}>{item.value}</div>
+              <div
+                style={{
+                  fontSize: 27,
+                  fontWeight: 700,
+                  marginTop: 12,
+                }}
+              >
+                {item.value}
+              </div>
             </div>
           ))}
         </section>
 
-        <section style={{
-          display: "grid",
-          gridTemplateColumns: "repeat(auto-fit, minmax(300px, 1fr))",
-          gap: 22
-        }}>
-          <div style={{
-            background: "white",
-            padding: 18,
-            borderRadius: 18,
-            border: "1px solid #e2e8f0"
-          }}>
-            <div style={{
-              display: "flex",
-              justifyContent: "space-between",
-              gap: 10,
-              marginBottom: 14
-            }}>
-              <h2 style={{ fontSize: 17, margin: 0 }}>Camera Feed</h2>
-              <span style={{ color: active ? "#16a34a" : "#64748b" }}>
-                {active ? "Streaming" : "Stopped"}
-              </span>
-            </div>
+        <section
+          style={{
+            display: "grid",
+            gridTemplateColumns: "repeat(auto-fit, minmax(290px, 1fr))",
+            gap: 20,
+          }}
+        >
+          <div
+            style={{
+              background: "white",
+              border: "1px solid #e2e8f0",
+              borderRadius: 18,
+              padding: 18,
+            }}
+          >
+            <h2 style={{ fontSize: 18, marginTop: 0 }}>
+              Live Camera
+            </h2>
 
             <video
               ref={video}
@@ -322,140 +339,209 @@ export default function Home() {
                 width: "100%",
                 aspectRatio: "16 / 10",
                 objectFit: "cover",
-                background: "#0f172a",
-                borderRadius: 12
+                background: "#111827",
+                borderRadius: 12,
               }}
             />
+
             <canvas ref={canvas} style={{ display: "none" }} />
 
-            <div style={{
-              display: "flex",
-              gap: 10,
-              flexWrap: "wrap",
-              marginTop: 18
-            }}>
-              <button disabled={active} onClick={start} style={{
-                flex: 1,
-                padding: 13,
-                border: 0,
-                borderRadius: 10,
-                background: active ? "#94a3b8" : "#2563eb",
-                color: "white",
-                fontWeight: 700,
-                cursor: active ? "not-allowed" : "pointer"
-              }}>▶ Start</button>
+            <label
+              style={{
+                display: "block",
+                marginTop: 18,
+                fontSize: 14,
+                fontWeight: 600,
+              }}
+            >
+              Detection interval
+            </label>
 
-              <button disabled={!active} onClick={stop} style={{
-                flex: 1,
-                padding: 13,
-                border: 0,
-                borderRadius: 10,
-                background: !active ? "#cbd5e1" : "#dc2626",
-                color: "white",
-                fontWeight: 700,
-                cursor: !active ? "not-allowed" : "pointer"
-              }}>■ Stop</button>
-
-              <button onClick={reset} style={{
-                padding: "13px 18px",
+            <select
+              value={intervalSec}
+              disabled={active}
+              onChange={(e) => setIntervalSec(Number(e.target.value))}
+              style={{
+                width: "100%",
+                marginTop: 8,
+                padding: 12,
                 border: "1px solid #cbd5e1",
-                borderRadius: 10,
-                background: "white",
-                color: "#334155",
-                fontWeight: 700,
-                cursor: "pointer"
-              }}>Reset</button>
+                borderRadius: 9,
+                background: active ? "#f1f5f9" : "white",
+                fontSize: 14,
+              }}
+            >
+              <option value={1}>Every 1 second</option>
+              <option value={2}>Every 2 seconds</option>
+            </select>
+
+            <div
+              style={{
+                display: "flex",
+                flexWrap: "wrap",
+                gap: 10,
+                marginTop: 18,
+              }}
+            >
+              <button
+                onClick={start}
+                disabled={active}
+                style={{
+                  ...buttonStyle,
+                  flex: 1,
+                  background: active ? "#94a3b8" : "#2563eb",
+                  color: "white",
+                }}
+              >
+                ▶ Start
+              </button>
+
+              <button
+                onClick={stop}
+                disabled={!active}
+                style={{
+                  ...buttonStyle,
+                  flex: 1,
+                  background: active ? "#dc2626" : "#cbd5e1",
+                  color: "white",
+                }}
+              >
+                ■ Stop
+              </button>
+
+              <button
+                onClick={reset}
+                style={{
+                  ...buttonStyle,
+                  background: "#e2e8f0",
+                  color: "#334155",
+                }}
+              >
+                Reset
+              </button>
             </div>
           </div>
 
-          <div style={{
-            background: "white",
-            padding: 22,
-            borderRadius: 18,
-            border: "1px solid #e2e8f0"
-          }}>
-            <h2 style={{ fontSize: 17, marginTop: 0 }}>
+          <div
+            style={{
+              background: "white",
+              border: "1px solid #e2e8f0",
+              borderRadius: 18,
+              padding: 22,
+            }}
+          >
+            <h2 style={{ fontSize: 18, marginTop: 0 }}>
               Monitoring Status
             </h2>
 
-            <div style={{
-              background: "#f8fafc",
-              borderRadius: 12,
-              padding: 16,
-              marginBottom: 18
-            }}>
+            <div
+              style={{
+                padding: 16,
+                borderRadius: 12,
+                background: "#f8fafc",
+                marginBottom: 18,
+              }}
+            >
               <div style={{ color: "#64748b", fontSize: 13 }}>
                 Current activity
               </div>
-              <p style={{ fontWeight: 700, marginBottom: 0 }}>{status}</p>
+              <p style={{ fontWeight: 700, marginBottom: 0 }}>
+                {status}
+              </p>
             </div>
 
-            <div style={{ marginBottom: 22 }}>
-              <div style={{
-                display: "flex",
-                justifyContent: "space-between",
-                marginBottom: 9,
-                fontSize: 14
-              }}>
-                <span>Segment progress</span>
-                <b>{Math.min(meters * 10, 100)}%</b>
-              </div>
-              <div style={{
-                height: 9,
-                background: "#e2e8f0",
-                borderRadius: 10,
-                overflow: "hidden"
-              }}>
-                <div style={{
-                  width: `${Math.min(meters * 10, 100)}%`,
-                  height: "100%",
-                  background: "#2563eb",
-                  transition: "width .2s"
-                }} />
-              </div>
-            </div>
-
-            <div style={{
-              padding: 16,
-              border: "1px solid #e2e8f0",
-              borderRadius: 12,
-              marginBottom: 18
-            }}>
+            <div
+              style={{
+                padding: 16,
+                border: "1px solid #e2e8f0",
+                borderRadius: 12,
+                marginBottom: 18,
+              }}
+            >
               <div style={{ color: "#64748b", fontSize: 13 }}>
                 GPS coordinates
               </div>
-              <p style={{
-                fontWeight: 600,
-                overflowWrap: "anywhere",
-                marginBottom: 0
-              }}>{gps}</p>
-            </div>
-
-            <div style={{
-              padding: 16,
-              borderRadius: 12,
-              background: "#eff6ff",
-              color: "#1e40af",
-              fontSize: 14,
-              lineHeight: 1.6
-            }}>
-              <b>How it works</b>
-              <p style={{ marginBottom: 0 }}>
-                Frames are sampled every second. After each 10 metres
-                of GPS distance, a batch is sent to FastAPI for
-                pothole detection and local result storage.
+              <p
+                style={{
+                  fontWeight: 600,
+                  overflowWrap: "anywhere",
+                  marginBottom: 0,
+                }}
+              >
+                {gps}
               </p>
             </div>
+
+            <div
+              style={{
+                padding: 16,
+                background: "#eff6ff",
+                color: "#1e40af",
+                borderRadius: 12,
+                marginBottom: 18,
+                fontSize: 14,
+              }}
+            >
+              <b>Last detection</b>
+              <p style={{ marginBottom: 4 }}>
+                {lastResult.length} detected objects in the latest frame
+              </p>
+              <p style={{ margin: 0, fontSize: 12 }}>
+                Time: {lastTime}
+              </p>
+            </div>
+
+            <h3 style={{ fontSize: 15 }}>Detected objects</h3>
+
+            <div style={{ maxHeight: 230, overflowY: "auto" }}>
+              {lastResult.length === 0 ? (
+                <p style={{ color: "#64748b", fontSize: 14 }}>
+                  No objects detected in the latest frame.
+                </p>
+              ) : (
+                lastResult.map((item, index) => (
+                  <div
+                    key={index}
+                    style={{
+                      padding: 12,
+                      marginBottom: 8,
+                      background: "#f8fafc",
+                      border: "1px solid #e2e8f0",
+                      borderRadius: 10,
+                    }}
+                  >
+                    <b>{item.class}</b>
+                    <span style={{ float: "right", color: "#2563eb" }}>
+                      {(item.confidence * 100).toFixed(1)}%
+                    </span>
+                  </div>
+                ))
+              )}
+            </div>
+
+            <p
+              style={{
+                marginTop: 18,
+                fontSize: 12,
+                lineHeight: 1.6,
+                color: "#64748b",
+              }}
+            >
+              Each successful inference is saved locally by FastAPI
+              with its timestamp and GPS coordinates.
+            </p>
           </div>
         </section>
 
-        <footer style={{
-          textAlign: "center",
-          color: "#94a3b8",
-          fontSize: 12,
-          marginTop: 26
-        }}>
-          RoadSense · Local ML Inference · FastAPI + YOLO
+        <footer
+          style={{
+            textAlign: "center",
+            color: "#94a3b8",
+            fontSize: 12,
+            marginTop: 25,
+          }}
+        >
+          RoadSense · Next.js · FastAPI · YOLO
         </footer>
       </div>
     </main>
